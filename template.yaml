@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+
+Parameters:
+  EDRLogBucketName:
+    Type: String
+  EDRLogPrefix:
+    Type: String
+    Default: 'logs/fdr/'
+  CrowdStrikeAccessKeyId:
+    Type: String
+  CrowdStrikeSecretAccessKey:
+    Type: String
+  CrowdStrikeSQSQueueUrl:
+    Type: String
+Mappings:
+  Lambda:
+    DataReplicator:
+      Name: 'CrowdStrikeDataReplicator'
+
+Resources:
+  FDRRole:
+    Type: 'AWS::IAM::Role'
+    DeletionPolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      RoleName: 'FDRRole'
+      Policies:
+        - PolicyName: EDRLogsWriteOnlyAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${EDRLogBucketName}/*'
+        - PolicyName: DataReplicatorWriteCloudwatchLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'logs:CreateLogGroup'
+                Resource: 'arn:aws:logs:::*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub
+                  - 'arn:aws:logs:::log-group/aws/lambda/${FuncName}:*'
+                  - { FuncName: !FindInMap [ Lambda, DataReplicator, Name ] }
+  EDRLogBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref EDRLogBucketName
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+  DataReplicatorFunc:
+    Type: 'AWS::Serverless::Function'
+    DeletionPolicy: Delete
+    Properties:
+      Handler: 'fdr.handler'
+      Role: !GetAtt FDRRole.Arn
+      Runtime: 'python3.7'
+      Timeout: 900
+      CodeUri: './fdr.py'
+      MemorySize: 512
+      FunctionName: !FindInMap [ Lambda, DataReplicator, Name ]
+      Environment:
+        Variables:
+          ACCESS_KEY_ID: !Ref CrowdStrikeAccessKeyId
+          SECRET_ACCESS_KEY: !Ref CrowdStrikeSecretAccessKey
+          SQS_QUEUE_URL: !Ref CrowdStrikeSQSQueueUrl
+          TARGET_BUCKET: !Ref EDRLogBucketName
+          LOG_PREFIX: !Ref EDRLogPrefix
+  FDRCloudWatchLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub
+        - '/aws/lambda/${Suffix}'
+        - { Suffix: !FindInMap [ Lambda, DataReplicator, Name ] }
+      RetentionInDays: 7
+  EventsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: every20min
+      ScheduleExpression: rate(20 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataReplicatorFunc.Arn
+          Id: lambda
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref DataReplicatorFunc
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt EventsRule.Arn
